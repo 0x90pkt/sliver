@@ -79,10 +79,10 @@ func NewWakeSession(intent, beaconID string) (*WakeSession, error) {
 	return &WakeSession{intent: intent, beaconID: beaconID}, nil
 }
 
-// NewWakeBeacon is a backward-compatible alias for NewWakeSession.
-// Deprecated: use NewWakeSession instead.
-func NewWakeBeacon(intent, beaconID string) (*WakeSession, error) {
-	return NewWakeSession(intent, beaconID)
+// NewWakeCallback constructs a WakeSession handler (callback-mode wake).
+// Alias for NewWakeSession — used by the trigger factory.
+func NewWakeCallback(intent, targetID string) (*WakeSession, error) {
+	return NewWakeSession(intent, targetID)
 }
 
 // Name implements intents.Handler.

@@ -26,11 +26,10 @@ package handlers
 //
 // Current handlers:
 //
-//   - WakeSession: fires a wake signal for a trigger implant. Trigger
-//     implants always establish interactive sessions (not beacons).
-//     For backward compatibility with legacy beacon-based configs,
-//     also updates the beacon's NextCheckin if the target exists.
-//     (NewWakeBeacon is retained as a deprecated alias.)
+//   - WakeSession (wake-callback): fires a wake signal for a trigger
+//     implant. Trigger implants always establish interactive callback
+//     sessions. For backward compatibility with legacy beacon-based
+//     configs, also updates the beacon's NextCheckin if the target exists.
 //
 //   - StopJob: stops a Sliver job by name (e.g., an mTLS listener,
 //     an HTTP listener) using a non-blocking JobCtrl send.
@@ -39,6 +38,10 @@ package handlers
 //     interactive shell over the connection. Fire-and-forget with a
 //     concurrency semaphore (default 10 concurrent sessions) to prevent
 //     resource exhaustion.
+//
+//   - Bind: opens a listener (TCP or UDP) on the server and plumbs a
+//     shell to the connecting operator. Validates connections against
+//     the trigger source IP. No session lifetime cap.
 //
 // Construction is config-time: the operator binds a task label to
 // a target (beacon UUID, job name) when the trigger listener starts.

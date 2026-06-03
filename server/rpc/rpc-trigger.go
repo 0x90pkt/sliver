@@ -21,6 +21,9 @@ package rpc
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/bishopfox/sliver/client/constants"
 	"github.com/bishopfox/sliver/protobuf/clientpb"
@@ -109,6 +112,23 @@ func (rpc *Server) TriggerFire(ctx context.Context, req *clientpb.TriggerFireReq
 	if len(req.SharedSecret) == 0 {
 		return nil, rpcError(errors.New("shared secret must be set"))
 	}
+
+	// "connect" intent: direct server→implant connection (no UDP trigger).
+	// Used by "trigger connect" command to attach to an existing bind port.
+	if req.Intent == "connect" {
+		proto, port, err := parseBindAddress(req.Payload)
+		if err != nil {
+			return nil, rpcError(fmt.Errorf("invalid bind address %q: %w", req.Payload, err))
+		}
+		triggerRPCLog.Infof("trigger connect: %s:%d (proto=%s)", req.TargetHost, port, proto)
+		go func() {
+			if err := c2.ConnectToBindImplant(req.TargetHost, port, req.SharedSecret, proto); err != nil {
+				triggerRPCLog.Errorf("trigger connect failed: %v", err)
+			}
+		}()
+		return &clientpb.TriggerFireResp{Sent: true}, nil
+	}
+
 	clientID := req.ClientID
 	if clientID == "" {
 		clientID = "sliver-operator"
@@ -129,12 +149,55 @@ func (rpc *Server) TriggerFire(ctx context.Context, req *clientpb.TriggerFireReq
 	// must not block the operator's fire command.
 	go recordTriggerActivity(req.SharedSecret, req.TargetHost, req.TargetPort)
 
+	// For bind intents: the implant responded with the actual bind
+	// address (e.g., "tcp://0.0.0.0:52341" or "udp://0.0.0.0:41337").
+	// The server automatically connects unless the payload contains
+	// "noconnect" (operator used --no-connect).
+	if req.Intent == "bind" && result.Output != "" && result.Error == "" {
+		noConnect := strings.Contains(req.Payload, "noconnect")
+		if !noConnect {
+			proto, port, err := parseBindAddress(result.Output)
+			if err == nil {
+				triggerRPCLog.Infof("bind response received, connecting to %s:%d (proto=%s)", req.TargetHost, port, proto)
+				go func() {
+					if err := c2.ConnectToBindImplant(req.TargetHost, port, req.SharedSecret, proto); err != nil {
+						triggerRPCLog.Errorf("bind connect failed: %v", err)
+					}
+				}()
+			}
+		} else {
+			triggerRPCLog.Infof("bind response received (no-connect mode): %s", result.Output)
+		}
+	}
+
 	return &clientpb.TriggerFireResp{
 		Sent:     result.Sent,
 		Output:   result.Output,
 		ExitCode: int32(result.ExitCode),
 		Error:    result.Error,
 	}, nil
+}
+
+// parseBindAddress extracts the protocol and port from a bind response.
+// Format: "tcp://0.0.0.0:52341" or "udp://0.0.0.0:4444".
+// Returns (protocol, port, error).
+func parseBindAddress(bindAddr string) (string, int, error) {
+	proto := "tcp"
+	addr := bindAddr
+	if idx := strings.Index(addr, "://"); idx >= 0 {
+		proto = addr[:idx]
+		addr = addr[idx+3:]
+	}
+	// Extract port from host:port.
+	i := strings.LastIndex(addr, ":")
+	if i < 0 {
+		return "", 0, errors.New("missing port in address")
+	}
+	port, err := strconv.Atoi(addr[i+1:])
+	if err != nil {
+		return "", 0, err
+	}
+	return proto, port, nil
 }
 
 // TriggerIntents returns the task bindings registered against a

