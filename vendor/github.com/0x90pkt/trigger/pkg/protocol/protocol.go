@@ -44,109 +44,7 @@ type TriggerMessage struct {
 	Nonce     string `json:"nonce"`
 	Timestamp string `json:"timestamp"`
 	Intent    string `json:"intent"`
-	Payload   string `json:"payload,omitempty"`   // command/data for bidirectional intents (e.g. exec)
 	Signature string `json:"signature,omitempty"`
-}
-
-// TriggerResponse is the on-wire structure implants send back for
-// bidirectional intents (e.g. exec). The response is signed with the
-// same HMAC secret and includes the original request nonce for
-// correlation.
-type TriggerResponse struct {
-	Version      int    `json:"version"`
-	Type         string `json:"type"`                     // always "response"
-	RequestNonce string `json:"request_nonce"`            // correlates to the original TriggerMessage.Nonce
-	ClientID     string `json:"client_id"`                // implant identifier
-	Nonce        string `json:"nonce"`                    // unique response nonce
-	Timestamp    string `json:"timestamp"`
-	ExitCode     int    `json:"exit_code"`
-	Output       string `json:"output"`                   // stdout+stderr from the executed command
-	Error        string `json:"error,omitempty"`           // execution error, if any
-	Signature    string `json:"signature,omitempty"`
-}
-
-// ResponseType is the constant value for TriggerResponse.Type.
-const ResponseType = "response"
-
-// SignResponse computes the HMAC-SHA256 signature for a TriggerResponse.
-func SignResponse(resp TriggerResponse, sharedSecret string) (string, error) {
-	if sharedSecret == "" {
-		return "", errors.New("shared secret must be set")
-	}
-	body, err := canonicalResponseJSON(resp)
-	if err != nil {
-		return "", err
-	}
-	mac := hmac.New(sha256.New, []byte(sharedSecret))
-	if _, err := mac.Write(body); err != nil {
-		return "", fmt.Errorf("failed computing hmac: %w", err)
-	}
-	return hex.EncodeToString(mac.Sum(nil)), nil
-}
-
-// VerifyResponse verifies a TriggerResponse signature.
-func VerifyResponse(resp TriggerResponse, sharedSecret string) (bool, error) {
-	if resp.Signature == "" {
-		return false, nil
-	}
-	expected, err := SignResponse(resp, sharedSecret)
-	if err != nil {
-		return false, err
-	}
-	return hmac.Equal([]byte(expected), []byte(resp.Signature)), nil
-}
-
-// EncodeResponse marshals a TriggerResponse to wire-format JSON.
-func EncodeResponse(resp TriggerResponse) ([]byte, error) {
-	b, err := json.Marshal(resp)
-	if err != nil {
-		return nil, fmt.Errorf("failed marshaling response: %w", err)
-	}
-	return b, nil
-}
-
-// DecodeResponse parses raw bytes as a TriggerResponse.
-func DecodeResponse(raw []byte) (TriggerResponse, error) {
-	var resp TriggerResponse
-	if err := json.Unmarshal(raw, &resp); err != nil {
-		return TriggerResponse{}, fmt.Errorf("invalid JSON response: %w", err)
-	}
-	if resp.Type != ResponseType {
-		return TriggerResponse{}, fmt.Errorf("expected type %q, got %q", ResponseType, resp.Type)
-	}
-	return resp, nil
-}
-
-// IsResponse peeks at raw JSON to check if it's a response frame
-// (has "type":"response"). This lets a listener distinguish between
-// inbound trigger messages and response frames on the same port.
-func IsResponse(raw []byte) bool {
-	var peek struct {
-		Type string `json:"type"`
-	}
-	if err := json.Unmarshal(raw, &peek); err != nil {
-		return false
-	}
-	return peek.Type == ResponseType
-}
-
-func canonicalResponseJSON(resp TriggerResponse) ([]byte, error) {
-	payload := map[string]interface{}{
-		"version":       resp.Version,
-		"type":          resp.Type,
-		"request_nonce": resp.RequestNonce,
-		"client_id":     resp.ClientID,
-		"nonce":         resp.Nonce,
-		"timestamp":     resp.Timestamp,
-		"exit_code":     resp.ExitCode,
-		"output":        resp.Output,
-		"error":         resp.Error,
-	}
-	b, err := json.Marshal(payload)
-	if err != nil {
-		return nil, fmt.Errorf("failed marshaling response signable payload: %w", err)
-	}
-	return b, nil
 }
 
 // NowUTC returns the current UTC time formatted to RFC3339 nanoseconds.
@@ -248,11 +146,6 @@ func canonicalSignableJSON(msg TriggerMessage) ([]byte, error) {
 		"nonce":     msg.Nonce,
 		"timestamp": msg.Timestamp,
 		"intent":    msg.Intent,
-	}
-	// Include payload in HMAC computation only when set, so existing
-	// wake/self-destruct packets remain signature-compatible.
-	if msg.Payload != "" {
-		payload["payload"] = msg.Payload
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {

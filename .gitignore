@@ -59,7 +59,6 @@ testing.md
 
 # Dependencies
 node_modules/
-vendor/
 bower_components/
 
 # Build output

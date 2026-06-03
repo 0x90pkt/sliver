@@ -1654,10 +1654,9 @@ message CertificateAuthorityInfo {
 // `config` oneof -- exactly one of the *Config message types is set
 // per binding.
 
-message WakeBeaconConfig {
-  // BeaconID (UUID string) of the beacon whose NextCheckin should be
-  // updated when the trigger fires.
-  string BeaconID = 1;
+message WakeCallbackConfig {
+  // TargetID (UUID string) of the session/beacon target to wake.
+  string TargetID = 1;
 }
 
 message StopJobConfig {
@@ -1692,16 +1691,32 @@ message ReverseShellConfig {
   bool UseTLS = 6;
 }
 
+message BindConfig {
+  // BindAddr is the host:port the implant/server opens its shell listener
+  // on. Format: "0.0.0.0:5555". Port 0 selects a random ephemeral port.
+  // The operator connects TO this endpoint.
+  string BindAddr = 1;
+  // Protocol selects TCP or UDP transport. Values: "tcp", "udp".
+  // Default (empty): "tcp".
+  string Protocol = 2;
+  // ShellPath absolute; empty => platform default (/bin/sh or cmd.exe).
+  string ShellPath = 3;
+  repeated string ShellArgs = 4;
+  // MaxConnections limits concurrent bind sessions. Default 1.
+  uint32 MaxConnections = 5;
+}
+
 message TriggerIntentBinding {
   // Name is the task label on the wire (operator's --task flag).
   string Name = 1;
   // Exactly one of the *Config fields below is set, selecting the
   // handler kind.
   oneof Config {
-    WakeBeaconConfig WakeBeacon = 10;
-    StopJobConfig    StopJob    = 11;
-    ExecConfig       Exec       = 12;
+    WakeCallbackConfig WakeCallback = 10;
+    StopJobConfig      StopJob      = 11;
+    ExecConfig         Exec         = 12;
     ReverseShellConfig ReverseShell = 13;
+    BindConfig         Bind         = 14;
   }
 }
 

