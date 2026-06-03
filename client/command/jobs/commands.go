@@ -268,7 +268,8 @@ Examples:
   trigger send 10.0.0.5 exec --payload "ls -la /tmp" --secret-env TRIGGERWAKE_SECRET
   trigger send 10.0.0.5 wake --secret "my-shared-secret" --client-id red-team-01
   trigger send 1 wake            (uses index from 'triggers' list)
-  trigger send 2 exec --payload "whoami"`,
+  trigger send 2 exec --payload "whoami"
+  trigger send 1 wake --callback mtls://10.0.0.5:8888   (dynamic callback)`,
 		Args: cobra.ExactArgs(2),
 		Run: func(cmd *cobra.Command, args []string) {
 			TriggerSendCmd(cmd, con, args)
@@ -282,6 +283,7 @@ Examples:
 		f.String("payload", "", "command/data for bidirectional intents (e.g. 'ls -la /tmp' for intent=exec)")
 		f.StringP("output", "o", "", "write exec output to file (only for intent=exec)")
 		f.String("comms", "", "preferred C2 transport for wake intent (e.g. mtls, wg)")
+		f.StringP("callback", "c", "", "dynamic callback address for wake intent (e.g. mtls://10.0.0.5:8888)")
 	})
 	triggerCmd.AddCommand(triggerSendCmd)
 

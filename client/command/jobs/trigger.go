@@ -329,9 +329,35 @@ func TriggerSendCmd(cmd *cobra.Command, con *console.SliverClient, args []string
 
 	payload, _ := cmd.Flags().GetString("payload")
 
+	// --callback flag: for wake intents, allows the operator to specify
+	// a dynamic callback address (e.g. "mtls://10.0.0.5:8888"). The
+	// callback URL is sent in the payload field and the implant will use
+	// it as a temporary C2 override instead of its baked-in C2 list.
+	// This is protected by the HMAC signature on the trigger packet.
+	callbackAddr, _ := cmd.Flags().GetString("callback")
+	if callbackAddr != "" {
+		if intent != "wake" {
+			con.PrintErrorf("--callback is only valid with intent=wake\n")
+			return
+		}
+		if !strings.Contains(callbackAddr, "://") {
+			con.PrintErrorf("--callback must be a full C2 URL (e.g. mtls://10.0.0.5:8888)\n")
+			return
+		}
+		// The callback URL becomes the payload. If the operator also
+		// specified --payload (transport hint), the callback URL takes
+		// precedence since it includes the scheme.
+		if payload != "" {
+			con.PrintWarnf("--callback overrides --payload for wake intent\n")
+		}
+		payload = callbackAddr
+	}
+
 	con.PrintInfof("Sending trigger packet: target=%s:%d intent=%s client-id=%s\n",
 		targetHost, port, intent, clientID)
-	if payload != "" {
+	if callbackAddr != "" {
+		con.PrintInfof("Dynamic callback: %s\n", callbackAddr)
+	} else if payload != "" {
 		con.PrintInfof("Payload: %s\n", payload)
 	}
 

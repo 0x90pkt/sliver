@@ -339,6 +339,7 @@ manually specifying the target IP, port, and secret.
   triggers target 1 192.168.1.42   Store target IP for trigger at index 1.
   trigger send 1 wake              Send a wake packet to trigger #1 (uses stored target + build config).
   trigger send 1 exec --payload "whoami"   Execute a command on trigger #1.
+  trigger send 1 wake --callback mtls://10.0.0.5:8888   Wake with dynamic callback address.
 `
 
 	stageListenerHelp = `[[.Bold]]Command:[[.Normal]] stage-listener <options>

